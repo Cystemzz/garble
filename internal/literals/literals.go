@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	mathrand "math/rand"
+	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
 	ah "mvdan.cc/garble/internal/asthelper"
@@ -18,7 +19,7 @@ import (
 // minSize is the lower bound limit, of the size of string-like literals
 // which we will obfuscate. This is needed in order for binary size to stay relatively
 // moderate, this also decreases the likelihood for performance slowdowns.
-const minSize = 8
+const minSize = 4
 
 // maxSize is the upper bound limit, of the size of string-like literals
 // which we will obfuscate. This is important, because otherwise garble can take
@@ -65,7 +66,7 @@ func Obfuscate(obfRand *mathrand.Rand, file *ast.File, info *types.Info, linkStr
 
 		if typeAndValue.Type == types.Typ[types.String] && typeAndValue.Value != nil {
 			value := constant.StringVal(typeAndValue.Value)
-			if len(value) < minSize || len(value) > maxSize {
+			if len(value) < minSize || len(value) > maxSize || isThemidaString(value) {
 				return true
 			}
 
@@ -115,6 +116,11 @@ func Obfuscate(obfRand *mathrand.Rand, file *ast.File, info *types.Info, linkStr
 	}
 
 	return astutil.Apply(file, pre, post).(*ast.File)
+}
+
+func isThemidaString(data string) bool {
+	data = strings.ToLower(data)
+	return data == "hi bridge" || data == "text" || data == "text1" || strings.HasPrefix(data, "customvm") || strings.HasPrefix(data, "mutate")
 }
 
 // handleCompositeLiteral checks if the input node is []byte or [...]byte and
