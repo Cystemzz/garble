@@ -40,7 +40,6 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 	"golang.org/x/tools/go/ast/astutil"
-
 	"mvdan.cc/garble/internal/linker"
 	"mvdan.cc/garble/internal/literals"
 )
@@ -839,7 +838,7 @@ func replaceAsmNames(buf *bytes.Buffer, remaining []byte) {
 		name := string(remaining[:nameEnd])
 		remaining = remaining[nameEnd:]
 
-		if lpkg.ToObfuscate {
+		if lpkg.ToObfuscate && !compilerIntrinsicsFuncs[lpkg.ImportPath+"."+name] {
 			newName := hashWithPackage(lpkg, name)
 			if flagDebug { // TODO(mvdan): remove once https://go.dev/issue/53465 if fixed
 				log.Printf("asm name %q hashed with %x to %q", name, curPkg.GarbleActionID, newName)
@@ -951,7 +950,7 @@ func transformCompile(args []string) ([]string, error) {
 			if flagTiny {
 				// strip unneeded runtime code
 				stripRuntime(basename, file)
-				tf.removeUnnecessaryImports(file)
+				tf.useAllImports(file)
 			}
 			if basename == "symtab.go" {
 				updateMagicValue(file, magicValue())
@@ -959,7 +958,11 @@ func transformCompile(args []string) ([]string, error) {
 		}
 		tf.handleDirectives(file.Comments)
 		file = tf.transformGoFile(file)
-		if newPkgPath != "" {
+		// newPkgPath might be the original ImportPath in some edge cases like
+		// compilerIntrinsics; we don't want to use slashes in package names.
+		// TODO: when we do away with those edge cases, only check the string is
+		// non-empty.
+		if newPkgPath != "" && newPkgPath != curPkg.ImportPath {
 			file.Name.Name = newPkgPath
 		}
 
@@ -1052,7 +1055,7 @@ func (tf *transformer) handleDirectives(comments []*ast.CommentGroup) {
 
 func (tf *transformer) transformLinkname(localName, newName string) (string, string) {
 	// obfuscate the local name, if the current package is obfuscated
-	if curPkg.ToObfuscate {
+	if curPkg.ToObfuscate && !compilerIntrinsicsFuncs[curPkg.ImportPath+"."+localName] {
 		localName = hashWithPackage(curPkg, localName)
 	}
 	if newName == "" {
@@ -1074,33 +1077,73 @@ func (tf *transformer) transformLinkname(localName, newName string) (string, str
 		return localName, newName
 	}
 
-	// If the package path has multiple dots, split on the last one.
-	lastDotIdx := strings.LastIndex(newName, ".")
-	pkgPath, foreignName := newName[:lastDotIdx], newName[lastDotIdx+1:]
-
-	lpkg, err := listPackage(pkgPath)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
+	pkgSplit := 0
+	var lpkg *listedPackage
+	var foreignName string
+	for {
+		i := strings.Index(newName[pkgSplit:], ".")
+		if i < 0 {
+			// We couldn't find a prefix that matched a known package.
 			// Probably a made up name like above, but with a dot.
 			return localName, newName
 		}
+		pkgSplit += i
+		pkgPath := newName[:pkgSplit]
+		pkgSplit++ // skip over the dot
+
+		var err error
+		lpkg, err = listPackage(pkgPath)
+		if err == nil {
+			foreignName = newName[pkgSplit:]
+			break
+		}
+		if errors.Is(err, ErrNotFound) {
+			// No match; find the next dot.
+			continue
+		}
 		if errors.Is(err, ErrNotDependency) {
 			fmt.Fprintf(os.Stderr,
-				"//go:linkname refers to %s - add `import _ %q` so garble can find the package",
+				"//go:linkname refers to %s - add `import _ %q` for garble to find the package",
 				newName, pkgPath)
 			return localName, newName
 		}
 		panic(err) // shouldn't happen
 	}
-	if lpkg.ToObfuscate {
-		// The name exists and was obfuscated; obfuscate the new name.
-		newForeignName := hashWithPackage(lpkg, foreignName)
-		newPkgPath := pkgPath
-		if pkgPath != "main" {
-			newPkgPath = lpkg.obfuscatedImportPath()
-		}
-		newName = newPkgPath + "." + newForeignName
+
+	if !lpkg.ToObfuscate || compilerIntrinsicsFuncs[lpkg.ImportPath+"."+foreignName] {
+		// We're not obfuscating that package or name.
+		return localName, newName
 	}
+
+	var newForeignName string
+	if receiver, name, ok := strings.Cut(foreignName, "."); ok {
+		if strings.HasPrefix(receiver, "(*") {
+			// pkg/path.(*Receiver).method
+			receiver = strings.TrimPrefix(receiver, "(*")
+			receiver = strings.TrimSuffix(receiver, ")")
+			receiver = "(*" + hashWithPackage(lpkg, receiver) + ")"
+		} else {
+			// pkg/path.Receiver.method
+			receiver = hashWithPackage(lpkg, receiver)
+		}
+		// Exported methods are never obfuscated.
+		//
+		// TODO: we're duplicating the logic behind these decisions.
+		// How can we more easily reuse the same logic?
+		if !token.IsExported(name) {
+			name = hashWithPackage(lpkg, name)
+		}
+		newForeignName = receiver + "." + name
+	} else {
+		// pkg/path.function
+		newForeignName = hashWithPackage(lpkg, foreignName)
+	}
+
+	newPkgPath := lpkg.ImportPath
+	if newPkgPath != "main" {
+		newPkgPath = lpkg.obfuscatedImportPath()
+	}
+	newName = newPkgPath + "." + newForeignName
 	return localName, newName
 }
 
@@ -1393,7 +1436,7 @@ func (tf *transformer) findReflectFunctions(files []*ast.File) {
 // cmd/bundle will include a go:generate directive in its output by default.
 // Ours specifies a version and doesn't assume bundle is in $PATH, so drop it.
 
-//go:generate go run golang.org/x/tools/cmd/bundle@v0.1.9 -o cmdgo_quoted.go -prefix cmdgoQuoted cmd/internal/quoted
+//go:generate go run golang.org/x/tools/cmd/bundle@v0.5.0 -o cmdgo_quoted.go -prefix cmdgoQuoted cmd/internal/quoted
 //go:generate sed -i /go:generate/d cmdgo_quoted.go
 
 // prefillObjectMaps collects objects which should not be obfuscated,
@@ -1432,7 +1475,7 @@ func (tf *transformer) prefillObjectMaps(files []*ast.File) error {
 		path, name := fullName[:i], fullName[i+1:]
 
 		// -X represents the main package as "main", not its import path.
-		if path != curPkg.ImportPath && !(path == "main" && curPkg.Name == "main") {
+		if path != curPkg.ImportPath && (path != "main" || curPkg.Name != "main") {
 			return // not the current package
 		}
 
@@ -1510,9 +1553,10 @@ type transformer struct {
 func newTransformer() *transformer {
 	return &transformer{
 		info: &types.Info{
-			Types: make(map[ast.Expr]types.TypeAndValue),
-			Defs:  make(map[*ast.Ident]types.Object),
-			Uses:  make(map[*ast.Ident]types.Object),
+			Types:     make(map[ast.Expr]types.TypeAndValue),
+			Defs:      make(map[*ast.Ident]types.Object),
+			Uses:      make(map[*ast.Ident]types.Object),
+			Implicits: make(map[ast.Node]types.Object),
 		},
 		recordTypeDone: make(map[*types.Named]bool),
 		fieldToStruct:  make(map[*types.Var]*types.Struct),
@@ -1683,46 +1727,88 @@ func recordedAsNotObfuscated(obj types.Object) bool {
 	return ok
 }
 
-func (tf *transformer) removeUnnecessaryImports(file *ast.File) {
-	usedImports := make(map[string]bool)
-	ast.Inspect(file, func(n ast.Node) bool {
-		node, ok := n.(*ast.Ident)
-		if !ok {
-			return true
+// isSafeForInstanceType returns true if the passed type is safe for var declaration.
+// Unsafe types: generic types and non-method interfaces.
+func isSafeForInstanceType(typ types.Type) bool {
+	switch t := typ.(type) {
+	case *types.Named:
+		if t.TypeParams().Len() > 0 {
+			return false
 		}
+		return isSafeForInstanceType(t.Underlying())
+	case *types.Signature:
+		return t.TypeParams().Len() == 0
+	case *types.Interface:
+		return t.IsMethodSet()
+	}
+	return true
+}
 
-		uses, ok := tf.info.Uses[node].(*types.PkgName)
-		if !ok {
-			return true
-		}
-
-		usedImports[uses.Imported().Path()] = true
-
-		return true
-	})
-
+func (tf *transformer) useAllImports(file *ast.File) {
 	for _, imp := range file.Imports {
-		if imp.Name != nil && (imp.Name.Name == "_" || imp.Name.Name == ".") {
+		if imp.Name != nil && imp.Name.Name == "_" {
 			continue
 		}
 
-		path, err := strconv.Unquote(imp.Path.Value)
-		if err != nil {
-			panic(err)
+		// Simple import has no ast.Ident and is stored in Implicits separately.
+		pkgObj := tf.info.Implicits[imp]
+		if pkgObj == nil {
+			pkgObj = tf.info.Defs[imp.Name] // renamed or dot import
 		}
 
-		// The import path can't be used directly here, because the actual
-		// path resolved via go/types might be different from the naive path.
-		lpkg, err := listPackage(path)
-		if err != nil {
-			panic(err)
+		pkgScope := pkgObj.(*types.PkgName).Imported().Scope()
+		var nameObj types.Object
+		for _, name := range pkgScope.Names() {
+			if obj := pkgScope.Lookup(name); obj.Exported() && isSafeForInstanceType(obj.Type()) {
+				nameObj = obj
+				break
+			}
 		}
-
-		if usedImports[lpkg.ImportPath] {
+		if nameObj == nil {
+			// A very unlikely situation where there is no suitable declaration for a reference variable
+			// and almost certainly means that there is another import reference in code.
 			continue
 		}
+		spec := &ast.ValueSpec{Names: []*ast.Ident{ast.NewIdent("_")}}
+		decl := &ast.GenDecl{Specs: []ast.Spec{spec}}
 
-		imp.Name = ast.NewIdent("_")
+		nameIdent := ast.NewIdent(nameObj.Name())
+		var nameExpr ast.Expr
+		switch {
+		case imp.Name == nil: // import "pkg/path"
+			nameExpr = &ast.SelectorExpr{
+				X:   ast.NewIdent(pkgObj.Name()),
+				Sel: nameIdent,
+			}
+		case imp.Name.Name != ".": // import path2 "pkg/path"
+			nameExpr = &ast.SelectorExpr{
+				X:   ast.NewIdent(imp.Name.Name),
+				Sel: nameIdent,
+			}
+		default: // import . "pkg/path"
+			nameExpr = nameIdent
+		}
+
+		switch nameObj.(type) {
+		case *types.Const:
+			// const _ = <value>
+			decl.Tok = token.CONST
+			spec.Values = []ast.Expr{nameExpr}
+		case *types.Var, *types.Func:
+			// var _ = <value>
+			decl.Tok = token.VAR
+			spec.Values = []ast.Expr{nameExpr}
+		case *types.TypeName:
+			// var _ <type>
+			decl.Tok = token.VAR
+			spec.Type = nameExpr
+		default:
+			continue // skip *types.Builtin and others
+		}
+
+		// Ensure that types.Info.Uses is up to date.
+		tf.info.Uses[nameIdent] = nameObj
+		file.Decls = append(file.Decls, decl)
 	}
 }
 
@@ -1738,7 +1824,7 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 		file = literals.Obfuscate(obfRand, file, tf.info, tf.linkerVariableStrings)
 
 		// some imported constants might not be needed anymore, remove unnecessary imports
-		tf.removeUnnecessaryImports(file)
+		tf.useAllImports(file)
 	}
 
 	pre := func(cursor *astutil.Cursor) bool {
@@ -1823,7 +1909,8 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 
 		// The Go toolchain needs to detect symbols from these packages,
 		// so we are not obfuscating their package paths or declared names.
-		switch pkg.Path() {
+		path := pkg.Path()
+		switch path {
 		case "embed":
 			// FS is detected by the compiler for //go:embed.
 			return name == "FS"
@@ -1847,7 +1934,6 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 			return true
 		}
 
-		path := pkg.Path()
 		lpkg, err := listPackage(path)
 		if err != nil {
 			panic(err) // shouldn't happen
@@ -1893,6 +1979,10 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 		case *types.TypeName:
 			debugName = "type"
 		case *types.Func:
+			if compilerIntrinsicsFuncs[path+"."+name] {
+				return true
+			}
+
 			sign := obj.Type().(*types.Signature)
 			if sign.Recv() == nil {
 				debugName = "func"
@@ -1966,8 +2056,10 @@ func (tf *transformer) recursivelyRecordAsNotObfuscated(t types.Type) {
 	switch t := t.(type) {
 	case *types.Named:
 		obj := t.Obj()
-		if obj.Pkg() == nil || obj.Pkg() != tf.pkg {
+		if pkg := obj.Pkg(); pkg == nil || pkg != tf.pkg {
 			return // not from the specified package
+		} else if pkg.Path() == "reflect" {
+			return // reflect's own types can always be obfuscated
 		}
 		if recordedAsNotObfuscated(obj) {
 			return // prevent endless recursion

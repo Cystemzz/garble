@@ -1,5 +1,30 @@
 # Changelog
 
+## [v0.9.1] - 2023-01-26
+
+This bugfix release continues support for Go 1.19 and the upcoming Go 1.20,
+and features:
+
+* Support obfuscating code which uses "dot imports" - [#610]
+* Fix linking errors for MIPS architectures - [#646]
+* Compiler intrinsics for packages like `math/bits` work again - [#655]
+
+## [v0.9.0] - 2023-01-17
+
+This release continues support for Go 1.19 and the upcoming Go 1.20.
+
+Noteworthy changes include:
+
+* Randomize the magic number header in `pclntab` - [#622]
+* Further reduce binary sizes with `-tiny` by 4%  - [#633]
+* Reduce the size overhead of all builds by 2% - [#629]
+* Reduce the binary size overhead of `-literals` by 20%  - [#637]
+* Support assembly references to the current package name - [#619]
+* Support package paths with periods in assembly - [#621]
+
+Note that the first two changes are done by patching and rebuilding Go's linker.
+While this adds complexity, it enables more link time obfuscation.
+
 ## [v0.8.0] - 2022-12-15
 
 This release drops support for Go 1.18, continues support for Go 1.19,
@@ -159,6 +184,19 @@ Known bugs:
 
 * obfuscating the standard library with `GOPRIVATE=*` is not well supported yet
 * `garble test` is temporarily disabled, as it is currently broken
+
+[v0.9.1]: https://github.com/burrowers/garble/releases/tag/v0.9.1
+[#610]: https://github.com/burrowers/garble/issues/610
+[#646]: https://github.com/burrowers/garble/issues/646
+[#655]: https://github.com/burrowers/garble/pull/655
+
+[v0.9.0]: https://github.com/burrowers/garble/releases/tag/v0.9.0
+[#619]: https://github.com/burrowers/garble/issues/619
+[#621]: https://github.com/burrowers/garble/issues/621
+[#622]: https://github.com/burrowers/garble/issues/622
+[#629]: https://github.com/burrowers/garble/pull/629
+[#633]: https://github.com/burrowers/garble/pull/633
+[#637]: https://github.com/burrowers/garble/pull/637
 
 [v0.8.0]: https://github.com/burrowers/garble/releases/tag/v0.8.0
 [#594]: https://github.com/burrowers/garble/issues/594
